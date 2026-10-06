@@ -1,0 +1,100 @@
+# Checks a public Lean certificate on a GitHub-hosted runner: comparator (statement, axioms, Lean kernel and nanoda),
+# optionally a full kernel replay, then uploads the logs and attests them. Every download is pinned and digest-checked.
+name: lean-certificate-check
+on:
+  workflow_dispatch:
+    inputs:
+      repo: {description: "certificate repository", default: "openai/NavierStokesAndEuler"}
+      sha: {description: "commit to check", default: "f9e8bc5b38b6e212696e8a30e3e91517af887bbd"}
+      config: {description: "comparator config", default: "ComparatorChallenges/NavierStokes.json"}
+      challenge: {description: "challenge module (built before any solution file)", default: "ComparatorChallenges.NavierStokes"}
+      solution: {description: "solution module", default: "NavierStokes.ComparatorSolution"}
+      replay: {description: "also run leanchecker --fresh (long)", default: "false"}
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      ELAN_VERSION: v4.2.4
+      ELAN_SHA256: 42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
+      LANDRUN_SHA256: 6ada66a06669e8994e174a7271af2db636308e55a0d6ec896cc7d326b46727f6
+      NANODA_SHA: 3a2407216ee84a75f9e1aead6803d0578be06ae7
+    steps:
+      - name: Free disk (Mathlib needs more than the default 14 GB)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: Facts
+        run: |
+          { echo "kernel=$(uname -r)"; echo "lsm=$(cat /sys/kernel/security/lsm 2>/dev/null || echo unreadable)";
+            echo "nproc=$(nproc)"; echo "repo=${{ inputs.repo }}"; echo "requested_sha=${{ inputs.sha }}"; } > facts.txt
+      - name: Certificate at the pinned commit
+        run: |
+          git clone --filter=blob:none "https://github.com/${{ inputs.repo }}" cert
+          git -C cert checkout --quiet "${{ inputs.sha }}"
+          echo "checked_out=$(git -C cert rev-parse HEAD)" >> facts.txt
+      - name: elan (digest checked)
+        run: |
+          curl -sSfL -o elan.tgz "https://github.com/leanprover/elan/releases/download/$ELAN_VERSION/elan-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$ELAN_SHA256  elan.tgz" | sha256sum -c -
+          tar xzf elan.tgz && ./elan-init -y --no-modify-path --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: landrun (digest checked)
+        run: |
+          curl -sSfL -o landrun https://github.com/Zouuup/landrun/releases/download/v0.1.17/landrun-linux-amd64
+          echo "$LANDRUN_SHA256  landrun" | sha256sum -c -
+          chmod +x landrun && sudo mv landrun /usr/local/bin/landrun
+      - name: nanoda (pinned commit)
+        run: |
+          git clone --quiet https://github.com/ammkrn/nanoda_lib
+          git -C nanoda_lib checkout --quiet "$NANODA_SHA"
+          (cd nanoda_lib && cargo build --release --locked)
+      - name: Mathlib cache, then the challenge before any solution file
+        working-directory: cert
+        run: |
+          lake exe cache get
+          lake build "${{ inputs.challenge }}"
+      - name: comparator and lean4export
+        working-directory: cert
+        run: |
+          lake build @lean4export/lean4export @Comparator/comparator || (cd .lake/packages/lean4export && lake build)
+          ls -la .lake/packages/lean4export/.lake/build/bin/ .lake/packages/Comparator/.lake/build/bin/
+      - name: comparator (builds the solution inside landrun)
+        working-directory: cert
+        env:
+          COMPARATOR_LANDRUN: /usr/local/bin/landrun
+          COMPARATOR_LEAN4EXPORT: ${{ github.workspace }}/cert/.lake/packages/lean4export/.lake/build/bin/lean4export
+          COMPARATOR_NANODA: ${{ github.workspace }}/nanoda_lib/target/release/nanoda_bin
+        run: |
+          set +e
+          start=$(date +%s)
+          lake env .lake/packages/Comparator/.lake/build/bin/comparator "${{ inputs.config }}" > ../comparator.log 2>&1
+          code=$?
+          echo "comparator_exit=$code" >> ../facts.txt
+          echo "comparator_seconds=$(( $(date +%s) - start ))" >> ../facts.txt
+          tail -40 ../comparator.log
+      - name: Full kernel replay (optional)
+        if: ${{ inputs.replay == 'true' }}
+        working-directory: cert
+        run: |
+          set +e
+          lake env leanchecker --fresh "${{ inputs.solution }}" > ../leanchecker.log 2>&1
+          echo "leanchecker_exit=$?" >> ../facts.txt
+      - name: Bundle
+        if: always()
+        run: |
+          touch comparator.log leanchecker.log
+          tar czf evidence.tgz facts.txt comparator.log leanchecker.log
+          cat facts.txt
+      - name: Attest the bundle
+        if: always()
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: evidence.tgz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: evidence
+          path: evidence.tgz
