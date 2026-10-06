@@ -10,6 +10,9 @@ on:
       challenge: {description: "challenge module (built before any solution file)", default: "ComparatorChallenges.NavierStokes"}
       solution: {description: "solution module", default: "NavierStokes.ComparatorSolution"}
       replay: {description: "also run leanchecker --fresh (long)", default: "false"}
+      plant_file: {description: "challenge file the planted control copies", default: "ComparatorChallenges/NavierStokes.lean"}
+      plant_from: {description: "text the control weakens", default: "C / (1 + ‖x‖) ^ K"}
+      plant_to: {description: "its weaker replacement", default: "C / (1 + ‖x‖) ^ (K / 2)"}
 permissions:
   contents: read
   id-token: write
@@ -51,11 +54,28 @@ jobs:
           git clone --quiet https://github.com/ammkrn/nanoda_lib
           git -C nanoda_lib checkout --quiet "$NANODA_SHA"
           (cd nanoda_lib && cargo build --release --locked)
-      - name: Mathlib cache, then the challenge before any solution file
+      - name: Mathlib cache, then the challenge and the planted control before any solution file
         working-directory: cert
+        env:
+          PLANT_FILE: ${{ inputs.plant_file }}
+          PLANT_FROM: ${{ inputs.plant_from }}
+          PLANT_TO: ${{ inputs.plant_to }}
+          CONFIG: ${{ inputs.config }}
+          CHALLENGE: ${{ inputs.challenge }}
         run: |
           lake exe cache get
-          lake build "${{ inputs.challenge }}"
+          python3 - <<'EOF'
+          import json, os, pathlib
+          src = pathlib.Path(os.environ["PLANT_FILE"])
+          text = src.read_text(encoding="utf-8")
+          assert os.environ["PLANT_FROM"] in text, "the planted text is not in the challenge"
+          planted = src.with_name(src.stem + "Planted.lean")
+          planted.write_text(text.replace(os.environ["PLANT_FROM"], os.environ["PLANT_TO"], 1), encoding="utf-8")
+          cfg = json.loads(pathlib.Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+          cfg["challenge_module"] = os.environ["CHALLENGE"] + "Planted"
+          pathlib.Path("planted-config.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+          EOF
+          lake build "$CHALLENGE" "${CHALLENGE}Planted"
       - name: comparator and lean4export
         working-directory: cert
         run: |
@@ -75,6 +95,17 @@ jobs:
           echo "comparator_exit=$code" >> ../facts.txt
           echo "comparator_seconds=$(( $(date +%s) - start ))" >> ../facts.txt
           tail -40 ../comparator.log
+      - name: Planted control (comparator must reject the weakened challenge)
+        working-directory: cert
+        env:
+          COMPARATOR_LANDRUN: /usr/local/bin/landrun
+          COMPARATOR_LEAN4EXPORT: ${{ github.workspace }}/cert/.lake/packages/lean4export/.lake/build/bin/lean4export
+          COMPARATOR_NANODA: ${{ github.workspace }}/nanoda_lib/target/release/nanoda_bin
+        run: |
+          set +e
+          lake env .lake/packages/Comparator/.lake/build/bin/comparator planted-config.json > ../planted.log 2>&1
+          echo "planted_exit=$?" >> ../facts.txt
+          tail -20 ../planted.log
       - name: Full kernel replay (optional)
         if: ${{ inputs.replay == 'true' }}
         working-directory: cert
@@ -85,8 +116,8 @@ jobs:
       - name: Bundle
         if: always()
         run: |
-          touch comparator.log leanchecker.log
-          tar czf evidence.tgz facts.txt comparator.log leanchecker.log
+          touch comparator.log planted.log leanchecker.log
+          tar czf evidence.tgz facts.txt comparator.log planted.log leanchecker.log
           cat facts.txt
       - name: Attest the bundle
         if: always()

@@ -8,6 +8,10 @@ configuration: the solution's theorems must state exactly the challenge's, use o
 the Lean kernel and [nanoda](https://github.com/ammkrn/nanoda_lib). The solution is built inside
 [landrun](https://github.com/Zouuup/landrun), after the challenge. A full `leanchecker --fresh` replay is optional.
 
+**Control:** before any solution file is built, the workflow also builds a planted copy of the challenge with one
+hypothesis weakened (by default, the initial velocity's decay rate `K` becomes `K / 2`). comparator must reject the
+solution against it (`planted_exit` non-zero); otherwise the run shows the check could not tell a difference.
+
 Every download is pinned: elan and landrun by SHA-256, nanoda by commit, the certificate by commit. The logs and a
 `facts.txt` (kernel, commit, exit codes, seconds) are bundled as `evidence.tgz`, uploaded, and attested.
 
